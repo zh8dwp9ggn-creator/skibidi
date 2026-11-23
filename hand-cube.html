@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Hand Cube</title>
+<style>
+  html, body { margin:0; height:100%; background:#05080f; color:#cfe8ff; font-family:-apple-system, "Sarabun", sans-serif; overflow:hidden; touch-action:none; }
+  #three { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  #cam { position:fixed; right:12px; bottom:12px; width:200px; height:150px; border-radius:12px; overflow:hidden; border:1px solid #1f6feb; background:#000; display:none; }
+  #cam video, #cam canvas { position:absolute; inset:0; width:100%; height:100%; transform:scaleX(-1); object-fit:cover; }
+  #cam video { opacity:.55; }
+  #hud { position:fixed; left:12px; top:12px; right:12px; pointer-events:none; }
+  #status { display:inline-block; padding:8px 12px; border-radius:10px; background:rgba(10,20,40,.75); border:1px solid #1f6feb55; font-size:14px; }
+  #help { margin-top:8px; font-size:13px; line-height:1.6; color:#8fb4d9; display:none; }
+  #start { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); padding:16px 28px; font-size:18px; border:0; border-radius:14px; background:#1f6feb; color:#fff; cursor:pointer; }
+  #start:disabled { opacity:.6; }
+</style>
+</head>
+<body>
+<canvas id="three"></canvas>
+<div id="cam"><video id="video" playsinline muted autoplay></video><canvas id="overlay"></canvas></div>
+<div id="hud">
+  <div id="status">แตะปุ่มเพื่อเริ่มกล้อง (หรือลากนิ้ว/เมาส์บนจอเพื่อหมุนได้เลย)</div>
+  <div id="help">
+    🤏 หยิบนิ้วโป้ง+ชี้ แล้วขยับมือ = หมุน<br>
+    🙌 ยกสองมือ กางออก/หุบเข้า = ซูม<br>
+    ✊ กำมือ = รีเซ็ต
+  </div>
+</div>
+<button id="start">เริ่มกล้อง</button>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from "three";
+
+// ---------- 3D scene ----------
+const canvas = document.getElementById("three");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+camera.position.z = 5;
+
+const geo = new THREE.BoxGeometry(1.6, 1.6, 1.6);
+const cube = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color:0x2f8cff, metalness:.3, roughness:.35, transparent:true, opacity:.85 }));
+const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color:0x9fd2ff }));
+cube.add(edges);
+scene.add(cube);
+scene.add(new THREE.AmbientLight(0xffffff, .6));
+const dl = new THREE.DirectionalLight(0xffffff, 1.2); dl.position.set(3,4,5); scene.add(dl);
+
+function resize(){
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w/h; camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize); resize();
+
+const target = { rx:0.4, ry:0.6, s:1 };
+const state  = { rx:0.4, ry:0.6, s:1 };
+
+(function loop(){
+  state.rx += (target.rx - state.rx) * 0.2;
+  state.ry += (target.ry - state.ry) * 0.2;
+  state.s  += (target.s  - state.s)  * 0.15;
+  cube.rotation.set(state.rx, state.ry, 0);
+  cube.scale.setScalar(state.s);
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+})();
+
+// ---------- pointer fallback (mouse / touch) ----------
+let dragging = false, lx = 0, ly = 0;
+canvas.addEventListener("pointerdown", e => { dragging = true; lx = e.clientX; ly = e.clientY; });
+addEventListener("pointerup", () => dragging = false);
+addEventListener("pointermove", e => {
+  if (!dragging) return;
+  target.ry += (e.clientX - lx) * 0.01;
+  target.rx += (e.clientY - ly) * 0.01;
+  lx = e.clientX; ly = e.clientY;
+});
+
+// ---------- hand tracking ----------
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("start");
+const helpEl = document.getElementById("help");
+const camBox = document.getElementById("cam");
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const octx = overlay.getContext("2d");
+
+const CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const dist = (a,b) => Math.hypot(a.x-b.x, a.y-b.y);
+
+function isPinch(lm){
+  const size = dist(lm[0], lm[9]) || 1;
+  return dist(lm[4], lm[8]) / size < 0.3;
+}
+function isFist(lm){
+  const tips = [8,12,16,20], pips = [6,10,14,18];
+  let folded = 0;
+  for (let i=0;i<4;i++) if (dist(lm[tips[i]], lm[0]) < dist(lm[pips[i]], lm[0])) folded++;
+  return folded >= 4;
+}
+
+let landmarker = null, lastVideoTime = -1;
+let lastPinch = null, fistFrames = 0;
+
+async function start(){
+  startBtn.disabled = true;
+  statusEl.textContent = "กำลังโหลดโมเดลตรวจจับมือ…";
+  try {
+    const { HandLandmarker, FilesetResolver } = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+    const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const opts = (delegate) => ({
+      baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate },
+      runningMode:"VIDEO", numHands:2
+    });
+    try { landmarker = await HandLandmarker.createFromOptions(fileset, opts("GPU")); }
+    catch { landmarker = await HandLandmarker.createFromOptions(fileset, opts("CPU")); }
+
+    statusEl.textContent = "กำลังเปิดกล้อง…";
+    const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:"user", width:640, height:480 }, audio:false });
+    video.srcObject = stream;
+    await video.play();
+    overlay.width = video.videoWidth || 640;
+    overlay.height = video.videoHeight || 480;
+    camBox.style.display = "block";
+    helpEl.style.display = "block";
+    startBtn.style.display = "none";
+    statusEl.textContent = "ยกมือขึ้นให้กล้องเห็นได้เลย";
+    requestAnimationFrame(detect);
+  } catch (err) {
+    console.error(err);
+    startBtn.disabled = false;
+    const msg = (err && err.name === "NotAllowedError") ? "ไม่ได้รับอนุญาตใช้กล้อง กรุณาอนุญาตในเบราว์เซอร์"
+      : (!window.isSecureContext ? "ต้องเปิดหน้านี้ผ่าน HTTPS หรือ localhost จึงจะใช้กล้องได้"
+      : "เกิดข้อผิดพลาด: " + (err && err.message ? err.message : err));
+    statusEl.textContent = msg;
+  }
+}
+startBtn.addEventListener("click", start);
+
+function detect(){
+  requestAnimationFrame(detect);
+  if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const res = landmarker.detectForVideo(video, performance.now());
+  const hands = res.landmarks || [];
+
+  // draw
+  octx.clearRect(0,0,overlay.width,overlay.height);
+  octx.lineWidth = 2;
+  for (const lm of hands){
+    octx.strokeStyle = "#4cc2ff"; octx.fillStyle = "#ffffff";
+    for (const [a,b] of CONNECTIONS){
+      octx.beginPath();
+      octx.moveTo(lm[a].x*overlay.width, lm[a].y*overlay.height);
+      octx.lineTo(lm[b].x*overlay.width, lm[b].y*overlay.height);
+      octx.stroke();
+    }
+    for (const p of lm){ octx.beginPath(); octx.arc(p.x*overlay.width, p.y*overlay.height, 3, 0, 7); octx.fill(); }
+  }
+
+  if (hands.length === 0){
+    lastPinch = null; fistFrames = 0;
+    statusEl.textContent = "ไม่เห็นมือ";
+    return;
+  }
+
+  // two hands -> zoom
+  if (hands.length >= 2){
+    lastPinch = null; fistFrames = 0;
+    const d = dist(hands[0][9], hands[1][9]); // normalized distance between palms
+    target.s = Math.min(3, Math.max(0.3, d * 3.5));
+    statusEl.textContent = "🙌 ซูม  x" + target.s.toFixed(2);
+    return;
+  }
+
+  const lm = hands[0];
+
+  // fist -> reset
+  if (isFist(lm)){
+    fistFrames++; lastPinch = null;
+    if (fistFrames > 6){
+      target.rx = 0.4; target.ry = 0.6; target.s = 1;
+      statusEl.textContent = "✊ รีเซ็ตแล้ว";
+    } else statusEl.textContent = "✊ กำลังรีเซ็ต…";
+    return;
+  }
+  fistFrames = 0;
+
+  // pinch -> rotate (mirror x because the view is mirrored)
+  if (isPinch(lm)){
+    const p = { x: 1 - (lm[4].x + lm[8].x)/2, y: (lm[4].y + lm[8].y)/2 };
+    if (lastPinch){
+      target.ry += (p.x - lastPinch.x) * 7;
+      target.rx += (p.y - lastPinch.y) * 7;
+    }
+    lastPinch = p;
+    statusEl.textContent = "🤏 กำลังหมุน";
+  } else {
+    lastPinch = null;
+    statusEl.textContent = "เห็นมือแล้ว — หยิบนิ้วเพื่อหมุน";
+  }
+}
+</script>
+</body>
+</html>
